@@ -1,0 +1,102 @@
+name: Fork session-end self-capture review
+
+# Independent evidence for #5413, not a competing production PR.
+# The reviewed source belongs to furuchanchan/gbrain; credit stays there.
+# Only an immutable, hash-checked hook file is overlaid in this disposable run.
+on:
+  push:
+    branches: [investigate/session-end-self-capture-5413-20260924]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-self-capture-review-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NO_COLOR: '1'
+
+jobs:
+  independent-review:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.13
+      - name: Record immutable review inputs
+        run: |
+          mkdir -p validation
+          git rev-parse HEAD > validation/evidence-checkout-sha.txt
+          bun --version > validation/bun-version.txt
+          printf '%s\n' 31f257a0a7b218b40e03d302bc6913c99f26f0ec > validation/source-base-sha.txt
+          printf '%s\n' furuchanchan/gbrain 34c944e94d77a8a205f67a157d8d013ba36a74f4 > validation/reviewed-candidate.txt
+          test "$(git hash-object src/commands/hook.ts)" = ec35af924cffacbf877907968b37334e51d12780
+          git diff --check
+      - name: Install frozen dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Require executed regressions against the unchanged source
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/hook-self-capture-review.serial.test.ts 2>&1 | tee validation/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$result" > validation/before-exit.txt
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*3 pass[[:space:]]*$' validation/before.log
+          grep -Eq '^[[:space:]]*6 fail[[:space:]]*$' validation/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' validation/before.log; then exit 1; fi
+      - name: Overlay only the independently reviewed hook source
+        run: |
+          timeout 120s git fetch --no-tags https://github.com/furuchanchan/gbrain.git 34c944e94d77a8a205f67a157d8d013ba36a74f4
+          git show 34c944e94d77a8a205f67a157d8d013ba36a74f4:src/commands/hook.ts > src/commands/hook.ts
+          test "$(git hash-object src/commands/hook.ts)" = f6db51d1a69187156ede02036c6b40bc64be9981
+          git diff --check
+          git diff -- src/commands/hook.ts > validation/reviewed-source.patch
+          git hash-object src/commands/hook.ts > validation/reviewed-source-blob.txt
+      - name: Require all identical regression tests to pass without skips
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/hook-self-capture-review.serial.test.ts 2>&1 | tee validation/after.log
+          grep -Eq '^[[:space:]]*9 pass[[:space:]]*$' validation/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' validation/after.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' validation/after.log; then exit 1; fi
+      - name: Existing capture contracts in separate processes
+        run: |
+          git config --global user.name 'Fork Validation'
+          git config --global user.email 'fork-validation@gbrain.test'
+          git config --global init.defaultBranch main
+          for file in test/hook-command.serial.test.ts test/codex-hook-lane.test.ts test/codex-hook-lane-archived.test.ts; do
+            env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test "$file" 2>&1 | tee "validation/$(basename "$file").log"
+          done
+      - name: Check test isolation
+        run: bash scripts/check-test-isolation.sh 2>&1 | tee validation/test-isolation.log
+      - name: Typecheck the reviewed source with the independent tests
+        run: bun run typecheck 2>&1 | tee validation/typecheck.log
+      - name: Preserve evidence and limitations even on failure
+        if: always()
+        run: |
+          mkdir -p validation
+          printf '%s\n' \
+            'Independent Linux/Bun 1.3.13 hook-contract review only.' \
+            'Not the full verify/unit/slow/Postgres/platform suites.' \
+            'No live Claude SessionEnd, idle sweep, or dream synthesis run.' \
+            'No claim about the reported managed-writer retry cause.' \
+            'No existing memories were deleted or repaired.' > validation/LIMITATIONS.txt
+          cp test/hook-self-capture-review.serial.test.ts validation/
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: session-end-self-capture-independent-review
+          path: validation/
+          if-no-files-found: error
