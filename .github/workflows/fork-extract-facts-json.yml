@@ -1,0 +1,93 @@
+name: Fork extract facts JSON validation
+
+# Investigation only; production changes stay in the disposable CI checkout.
+on:
+  push:
+    branches: [investigate/extract-facts-json-5448-20260924]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-extract-facts-json-5448
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NO_COLOR: '1'
+  BASE: 04f7df5c3a62d4edf4d37503bafb15990b0e4617
+
+jobs:
+  validate:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Pin source and install frozen dependencies
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git hash-object src/commands/extract-conversation-facts.ts)" = 78a8a719dbc368d5f3bb5cbe203944650bf5f4e2
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          bun --version > evidence/bun-version.txt
+          bun install --frozen-lockfile
+      - name: Require executed failures against the unchanged handler
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*2 pass[[:space:]]*$' evidence/before.log
+          grep -Eq '^[[:space:]]*2 fail[[:space:]]*$' evidence/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/before.log; then exit 1; fi
+      - name: Apply the output-only candidate and repeat exactly the same tests
+        run: |
+          python3 .context/extract-facts-json-5448/apply-candidate.py
+          git diff --check
+          git diff "$BASE" -- src/commands/extract-conversation-facts.ts test/extract-conversation-facts-json.test.ts > evidence/candidate.patch
+          git hash-object src/commands/extract-conversation-facts.ts > evidence/candidate-source-blob.txt
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/after.log
+          grep -Eq '^[[:space:]]*4 pass[[:space:]]*$' evidence/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/after.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/after.log; then exit 1; fi
+      - name: Run existing extraction and flag-registry tests
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/extract-conversation-facts.test.ts test/extract-conversation-facts-workers.test.ts test/cli-flag-validation.test.ts 2>&1 | tee evidence/adjacent.log
+          bun run build:flag-registry 2>&1 | tee evidence/registry-generation.log
+          git diff --exit-code -- src/core/cli-flag-registry.generated.ts
+      - name: Typecheck and check test isolation
+        run: |
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+          bash scripts/check-test-isolation.sh 2>&1 | tee evidence/isolation.log
+      - name: Record exact scope and remaining gates
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' \
+            'AI-assisted investigation of #5448, reported by gavinwade.' \
+            'Ubuntu 24.04 / Bun 1.4.0; no native Windows or macOS validation.' \
+            'New tests invoke the real handler with an empty, read-only engine fixture.' \
+            'Not a real datastore or a full src/cli.ts dispatch test.' \
+            'Nonempty JSON aggregation, partial failure/lock/budget exit cases and background job output remain to validate.' \
+            'No full verify/unit/slow/Postgres/platform suites or live provider calls.' \
+            'Production candidate exists only in the disposable checkout; no upstream PR.' \
+            > evidence/LIMITATIONS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: extract-facts-json-5448-evidence
+          path: evidence/
+          if-no-files-found: error
