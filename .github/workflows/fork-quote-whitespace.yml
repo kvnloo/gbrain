@@ -1,0 +1,86 @@
+name: Fork quote whitespace validation
+
+# Fork-only validation. No production branch is modified by this workflow.
+on:
+  push:
+    branches: [investigate/quote-whitespace-5451-20260924]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-quote-whitespace-5451
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NO_COLOR: '1'
+  BASE: 04f7df5c3a62d4edf4d37503bafb15990b0e4617
+
+jobs:
+  validate:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Record source identity and install frozen dependencies
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          test "$(git hash-object src/core/cycle/synthesize-verify.ts)" = 248f7ea39cc4869fd57da09ee411877fd957bb38
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          bun --version > evidence/bun-version.txt
+          bun install --frozen-lockfile
+      - name: Require executed regression failures before the fix
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/cycle-synthesize-whitespace-map.test.ts 2>&1 | tee evidence/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*1 pass[[:space:]]*$' evidence/before.log
+          grep -Eq '^[[:space:]]*4 fail[[:space:]]*$' evidence/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/before.log; then exit 1; fi
+      - name: Apply only the reviewed mapping fix and require all regressions pass
+        run: |
+          python3 .context/quote-whitespace-5451/apply-candidate.py
+          git diff --check
+          git diff "$BASE" -- src/core/cycle/synthesize-verify.ts test/cycle-synthesize-whitespace-map.test.ts > evidence/candidate.patch
+          git hash-object src/core/cycle/synthesize-verify.ts > evidence/candidate-source-blob.txt
+          git hash-object test/cycle-synthesize-whitespace-map.test.ts > evidence/regression-test-blob.txt
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/cycle-synthesize-whitespace-map.test.ts 2>&1 | tee evidence/after.log
+          grep -Eq '^[[:space:]]*5 pass[[:space:]]*$' evidence/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/after.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/after.log; then exit 1; fi
+      - name: Exercise existing repair and provenance coverage
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/cycle-synthesize-verify.test.ts 2>&1 | tee evidence/existing-repair.log
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 300s bun test test/cycle/extract-atoms-quote-provenance.test.ts 2>&1 | tee evidence/existing-provenance.log
+      - name: Typecheck and enforce test isolation
+        run: |
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+          bash scripts/check-test-isolation.sh 2>&1 | tee evidence/isolation.log
+      - name: Record validation scope
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' 'Ubuntu 24.04 / Bun 1.4.0.' 'Production edit exists only in this disposable checkout.' 'No full verify/unit/slow/Postgres/platform suites or live model calls.' 'No existing memory is rewritten or repaired by this workflow.' 'Window scoring, slack, thresholds and ambiguity policy are unchanged.' > evidence/LIMITATIONS.txt
+          git diff --stat "$BASE" -- src/core/cycle/synthesize-verify.ts test/cycle-synthesize-whitespace-map.test.ts >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: quote-whitespace-5451-evidence
+          path: evidence/
+          if-no-files-found: error
