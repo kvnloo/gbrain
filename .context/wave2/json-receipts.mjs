@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve('.');
-const cases = ['multi', 'skips', 'failure', 'lock', 'budget', 'failure-lock', 'failure-budget'];
+const cases = ['multi', 'skips', 'failure', 'lock', 'budget', 'failure-lock', 'failure-budget', 'discovery-failure'];
 if (process.argv[2] === '--child') {
   const scenario = process.argv[3];
   assert.ok(cases.includes(scenario));
@@ -60,7 +60,11 @@ if (process.argv[2] === '--child') {
     return getPage(slug, ...args);
   };
   try {
-    await runExtractConversationFacts(engine, ['--json', '--dry-run']);
+    // --force skips discovery's freshness read so injected faults reach the
+    // worker's existing partial-outcome handling; the discovery case stays unchanged.
+    const args = ['--json', '--dry-run'];
+    if (!['multi', 'skips', 'discovery-failure'].includes(scenario)) args.push('--force');
+    await runExtractConversationFacts(engine, args);
     evidence.handlerReturned = true;
     const after = await engine.executeRaw('SELECT (SELECT count(*) FROM facts) AS facts, (SELECT count(*) FROM pages) AS pages, (SELECT count(*) FROM op_checkpoints) AS checkpoints');
     assert.deepEqual(after, before, 'A completed dry-run must not change these durable row counts');
@@ -86,6 +90,19 @@ if (process.argv[2] === '--child') {
       const observed = JSON.parse(readFileSync(receipt, 'utf8'));
       writeFileSync(`evidence/json/${scenario}.receipt.json`, JSON.stringify(observed, null, 2));
       assert.equal(observed.networkCalls, 0, `${scenario}: unexpected network attempt`);
+      if (scenario === 'discovery-failure') {
+        assert.equal(result.status, 1);
+        assert.equal(result.stdout, '');
+        assert.match(result.stderr, /Injected fixture page-read failure/);
+        assert.deepEqual(observed.faults, ['failure']);
+        assert.equal(observed.handlerReturned, false);
+        results.push({ scenario, status: result.status, fixture: observed });
+        console.log('PASS discovery-failure: exit=1, no fabricated completion summary');
+        continue;
+      }
+      if (!result.stdout.trim()) {
+        throw new Error(`${scenario}: missing JSON; exit=${result.status}; stderr=${result.stderr}`);
+      }
       const output = JSON.parse(result.stdout);
       assert.equal(output.schema_version, 1);
       assert.equal(output.dry_run, true);

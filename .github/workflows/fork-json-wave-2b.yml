@@ -1,0 +1,81 @@
+name: Fork JSON receipt boundary validation
+on:
+  push:
+    branches: [investigate/json-receipts-wave-2b-20260924]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-gbrain-json-wave-2b
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  NO_COLOR: '1'
+  BASE: 467ff6737f741375a9a78eafd2818634d908eb99
+  INPUTS: eda6e65003f097834ea7ddd9fd3c882f0e51d482
+jobs:
+  json-receipts:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Retrieve the same previously validated production candidate
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$INPUTS"
+          test "$(git hash-object src/commands/extract-conversation-facts.ts)" = 78a8a719dbc368d5f3bb5cbe203944650bf5f4e2
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          timeout 120s git fetch --no-tags origin 1a3fd4cbf722318b1e069c6e282445ec262561d2
+          git show 1a3fd4cbf722318b1e069c6e282445ec262561d2:test/extract-conversation-facts-json.test.ts > test/extract-conversation-facts-json.test.ts
+          git show 1a3fd4cbf722318b1e069c6e282445ec262561d2:.context/extract-facts-json-5448/apply-candidate.py > "$RUNNER_TEMP/apply-json.py"
+          bun install --frozen-lockfile
+      - name: Keep the original executed discrimination gate
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*2 pass[[:space:]]*$' evidence/before.log
+          grep -Eq '^[[:space:]]*2 fail[[:space:]]*$' evidence/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/before.log; then exit 1; fi
+          python3 "$RUNNER_TEMP/apply-json.py"
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/after.log
+          grep -Eq '^[[:space:]]*4 pass[[:space:]]*$' evidence/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/after.log
+          git diff --check
+          git diff -- src/commands/extract-conversation-facts.ts > evidence/candidate.patch
+      - name: Separate discovery failure from partial worker outcomes
+        run: |
+          timeout 900s bun .context/wave2/json-receipts.mjs 2>&1 | tee evidence/json-integration.log
+      - name: Adjacent extraction and static gates
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/extract-conversation-facts.test.ts test/extract-conversation-facts-workers.test.ts test/cli-flag-validation.test.ts 2>&1 | tee evidence/adjacent.log
+          bun run build:flag-registry 2>&1 | tee evidence/registry.log
+          git diff --exit-code -- src/core/cli-flag-registry.generated.ts
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+          bash scripts/check-test-isolation.sh 2>&1 | tee evidence/isolation.log
+      - name: Preserve the failed experiment and validation limits
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' 'Corrects the fixture from run 36096432059; no production candidate change.' 'Original fault fired during findFreshExtractionOutcomes before the worker pool.' 'Fault scenarios now use --force on disposable dry-run data to reach per-page handling.' 'A separate discovery-failure control preserves exit 1 with no fabricated summary.' 'Eight intended PGLite/handler scenarios; verify execution log before claiming all passed.' 'No actual provider spending, cross-process contention, full CLI dispatch or background jobs.' 'No operator configuration or credentials; no full test:full or platform matrix.' > evidence/LIMITATIONS.txt
+          for file in evidence/json/*.stderr; do
+            if [[ -f "$file" ]]; then printf '\n--- %s ---\n' "$file"; tail -40 "$file"; fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: json-5448-wave-2b-evidence
+          path: evidence/
+          if-no-files-found: error
