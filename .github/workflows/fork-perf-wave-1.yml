@@ -1,0 +1,118 @@
+name: Fork performance wave 1
+on:
+  push:
+    branches: [investigate/perf-wave-1-20260924]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-gbrain-perf-wave-1
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  NO_COLOR: '1'
+  BASE: 467ff6737f741375a9a78eafd2818634d908eb99
+jobs:
+  experiments:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        lane: [mapless, numeric, combined]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Pin and prepare one isolated candidate
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          bun install --frozen-lockfile
+          python3 .context/perf-wave-1/prepare.py '${{ matrix.lane }}'
+          git diff --check
+          git diff -- src/core/cycle/synthesize-verify.ts > evidence/candidate.patch
+          git hash-object src/core/cycle/synthesize-verify.ts > evidence/candidate-blob.txt
+      - name: Require semantic parity, then collect alternating measurements
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 300s bun .context/perf-wave-1/probe.mjs '${{ matrix.lane }}' 2>&1 | tee evidence/probe.log
+          rm src/core/cycle/.wave1-baseline.ts
+      - name: Run native adjacent suites and typecheck
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/cycle-synthesize-verify.test.ts test/cycle/extract-atoms-quote-provenance.test.ts test/managed-synthesis-postprocess.test.ts 2>&1 | tee evidence/adjacent.log
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: gbrain-perf-wave-1-${{ matrix.lane }}
+          path: evidence/
+          if-no-files-found: error
+  quote-acceptance:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Retrieve only the previously tested regression file
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$BASE"
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          timeout 120s git fetch --no-tags origin 25beef27c5fea001e5cc3dfecd82a94a2ac4ab85
+          git show 25beef27c5fea001e5cc3dfecd82a94a2ac4ab85:test/cycle-synthesize-whitespace-map.test.ts > test/cycle-synthesize-whitespace-map.test.ts
+          bun install --frozen-lockfile
+      - name: Repeat actual failing-before and passing-after evidence on current base
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/cycle-synthesize-whitespace-map.test.ts 2>&1 | tee evidence/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*1 pass[[:space:]]*$' evidence/before.log
+          grep -Eq '^[[:space:]]*4 fail[[:space:]]*$' evidence/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/before.log; then exit 1; fi
+          python3 .context/perf-wave-1/prepare.py whitespace
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/cycle-synthesize-whitespace-map.test.ts 2>&1 | tee evidence/after.log
+          grep -Eq '^[[:space:]]*5 pass[[:space:]]*$' evidence/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/after.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/after.log; then exit 1; fi
+          git diff --check
+          git diff -- src/core/cycle/synthesize-verify.ts > evidence/source.patch
+          cp test/cycle-synthesize-whitespace-map.test.ts evidence/
+      - name: Adjacent managed and unmanaged checks
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/cycle-synthesize-verify.test.ts test/cycle/extract-atoms-quote-provenance.test.ts test/managed-synthesis-postprocess.test.ts 2>&1 | tee evidence/adjacent.log
+      - name: Broader static acceptance
+        run: |
+          timeout 900s bun run verify 2>&1 | tee evidence/verify.log
+      - name: Full unit acceptance, including upstream serial post-pass
+        run: |
+          timeout 1800s bun run test 2>&1 | tee evidence/unit.log
+      - name: Explicit remaining boundaries
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' 'Ubuntu 24.04 / Bun 1.4.0 only.' 'Not full test:full: slow, real-Postgres E2E and platform/persistence matrices are not requested here.' 'No live model loop, no paid provider, no user corpus.' 'Production edit is disposable; this workflow does not publish a clean branch or PR.' > evidence/LIMITATIONS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: quote-5451-current-base-acceptance
+          path: evidence/
+          if-no-files-found: error
