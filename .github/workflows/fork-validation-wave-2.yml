@@ -1,0 +1,125 @@
+name: Fork validation wave 2
+on:
+  push:
+    branches: [investigate/validation-wave-2-20260924]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-gbrain-validation-wave-2
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  NO_COLOR: '1'
+  BASE: 467ff6737f741375a9a78eafd2818634d908eb99
+  INPUTS: 6e3595508c7b031c21cce7ec982e1b0d1c732506
+jobs:
+  json-receipts:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Pin source and retrieve the already validated JSON candidate
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$INPUTS"
+          test "$(git hash-object src/commands/extract-conversation-facts.ts)" = 78a8a719dbc368d5f3bb5cbe203944650bf5f4e2
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          timeout 120s git fetch --no-tags origin 1a3fd4cbf722318b1e069c6e282445ec262561d2
+          git show 1a3fd4cbf722318b1e069c6e282445ec262561d2:test/extract-conversation-facts-json.test.ts > test/extract-conversation-facts-json.test.ts
+          git show 1a3fd4cbf722318b1e069c6e282445ec262561d2:.context/extract-facts-json-5448/apply-candidate.py > "$RUNNER_TEMP/apply-json.py"
+          bun install --frozen-lockfile
+      - name: Preserve the original discrimination gate on this base
+        run: |
+          set +e
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/before.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -eq 1
+          grep -Eq '^[[:space:]]*2 pass[[:space:]]*$' evidence/before.log
+          grep -Eq '^[[:space:]]*2 fail[[:space:]]*$' evidence/before.log
+          if grep -Eq '^[[:space:]]*[1-9][0-9]* (skip|todo)|errors? between tests' evidence/before.log; then exit 1; fi
+          python3 "$RUNNER_TEMP/apply-json.py"
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL bun test test/extract-conversation-facts-json.test.ts 2>&1 | tee evidence/after.log
+          grep -Eq '^[[:space:]]*4 pass[[:space:]]*$' evidence/after.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/after.log
+          git diff --check
+          git diff -- src/commands/extract-conversation-facts.ts > evidence/candidate.patch
+      - name: Exercise real PGLite aggregation and injected exit-status boundaries
+        run: |
+          timeout 900s bun .context/wave2/json-receipts.mjs 2>&1 | tee evidence/json-integration.log
+      - name: Adjacent extraction and static gates
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/extract-conversation-facts.test.ts test/extract-conversation-facts-workers.test.ts test/cli-flag-validation.test.ts 2>&1 | tee evidence/adjacent.log
+          bun run build:flag-registry 2>&1 | tee evidence/registry.log
+          git diff --exit-code -- src/core/cli-flag-registry.generated.ts
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+          bash scripts/check-test-isolation.sh 2>&1 | tee evidence/isolation.log
+      - name: Record scope
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' 'Seven real-handler/PGLite scenarios, not full CLI dispatch.' 'Dry-run only; failure/lock/budget conditions are injected at the page-read seam.' 'Not real cross-process lock contention, provider charging, extraction quality or background-job output.' 'No operator configuration or provider credentials passed to the fixture.' 'No full test:full acceptance or production branch publication.' > evidence/LIMITATIONS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: json-5448-wave-2-evidence
+          path: evidence/
+          if-no-files-found: error
+  numeric-page-repair:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        replicate: [1, 2]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Pin one candidate on each fresh runner
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$INPUTS"
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          bun install --frozen-lockfile
+          python3 .context/perf-wave-1/prepare.py numeric
+          git diff --check
+          git diff -- src/core/cycle/synthesize-verify.ts > evidence/candidate.patch
+      - name: Repeat semantic controls and measure whole-page verification
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 300s bun .context/perf-wave-1/probe.mjs numeric 2>&1 | tee evidence/original-probe.log
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 300s bun .context/wave2/page-probe.mjs '${{ matrix.replicate }}' 2>&1 | tee evidence/page-probe.log
+          rm src/core/cycle/.wave1-baseline.ts
+      - name: Existing repair and provenance tests
+        run: |
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL timeout 900s bun test test/cycle-synthesize-verify.test.ts test/cycle/extract-atoms-quote-provenance.test.ts test/managed-synthesis-postprocess.test.ts 2>&1 | tee evidence/adjacent.log
+          bun run typecheck 2>&1 | tee evidence/typecheck.log
+      - name: Record measurement boundary
+        if: always()
+        run: |
+          mkdir -p evidence
+          printf '%s\n' 'Independent Ubuntu/Bun runners; synthetic inputs and raw ABBA/BAAB samples.' 'Whole-page repair entry point, not provider/database/UI end-to-end latency.' 'Keep small/duplicate/masked controls, including negative or neutral outcomes.' 'No significance or production speedup claim; no new runtime concurrency.' > evidence/LIMITATIONS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: numeric-page-wave-2-${{ matrix.replicate }}
+          path: evidence/
+          if-no-files-found: error
