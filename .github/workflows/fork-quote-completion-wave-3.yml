@@ -1,0 +1,111 @@
+name: Fork quote acceptance completion
+# Resume only the unfinished boundaries of run 36094995387.
+# Four unit shards completed there: 27424 pass, 0 fail, 63 skip.
+# This is not a new production change or a claim of full acceptance.
+on:
+  push:
+    branches: [investigate/quote-completion-wave-3-20260925]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: fork-quote-completion-wave-3
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
+env:
+  NO_COLOR: '1'
+  BASE: 467ff6737f741375a9a78eafd2818634d908eb99
+  INPUTS: 6e3595508c7b031c21cce7ec982e1b0d1c732506
+jobs:
+  remaining-acceptance:
+    if: github.repository == 'kvnloo/gbrain'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        lane: [serial-1, serial-2, slow]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.0
+      - name: Reconstruct exactly the source and test already validated
+        run: |
+          mkdir -p evidence
+          test "$(git rev-parse HEAD^)" = "$INPUTS"
+          test "$(git rev-parse HEAD^^)" = "$BASE"
+          test "$(git hash-object src/core/cycle/synthesize-verify.ts)" = 248f7ea39cc4869fd57da09ee411877fd957bb38
+          git rev-parse HEAD > evidence/validation-commit.txt
+          printf '%s\n' "$BASE" > evidence/base-commit.txt
+          printf '%s\n' '${{ matrix.lane }}' > evidence/lane.txt
+          timeout 120s git fetch --no-tags origin 25beef27c5fea001e5cc3dfecd82a94a2ac4ab85
+          git show 25beef27c5fea001e5cc3dfecd82a94a2ac4ab85:test/cycle-synthesize-whitespace-map.test.ts > test/cycle-synthesize-whitespace-map.test.ts
+          test "$(git hash-object test/cycle-synthesize-whitespace-map.test.ts)" = 7a1183095d2cb000ed4a5d5ba8f37e2a63f802eb
+          python3 .context/perf-wave-1/prepare.py whitespace
+          git -c core.abbrev=8 diff -- src/core/cycle/synthesize-verify.ts > evidence/source.patch
+          test "$(git hash-object evidence/source.patch)" = b9dd1f8fa062dbdca53824e13352332413e1aa3c
+          git hash-object src/core/cycle/synthesize-verify.ts > evidence/source-blob.txt
+          git diff --check
+          bun install --frozen-lockfile
+          env -u DATABASE_URL -u GBRAIN_DATABASE_URL -u GBRAIN_HOME bun test test/cycle-synthesize-whitespace-map.test.ts 2>&1 | tee evidence/regression.log
+          grep -Eq '^[[:space:]]*5 pass[[:space:]]*$' evidence/regression.log
+          grep -Eq '^[[:space:]]*0 fail[[:space:]]*$' evidence/regression.log
+      - name: Prove the two native serial shards partition the entire serial lane
+        if: matrix.lane != 'slow'
+        run: |
+          env -u GBRAIN_HOME SHARD=1/1 bash scripts/run-serial-tests.sh --dry-run-list > evidence/serial-all.txt
+          env -u GBRAIN_HOME SHARD=1/2 bash scripts/run-serial-tests.sh --dry-run-list > evidence/serial-1.txt
+          env -u GBRAIN_HOME SHARD=2/2 bash scripts/run-serial-tests.sh --dry-run-list > evidence/serial-2.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          from collections import Counter
+          def lines(name):
+              return Path('evidence', name).read_text().splitlines()
+          all_files = lines('serial-all.txt')
+          one, two = lines('serial-1.txt'), lines('serial-2.txt')
+          assert all_files and one and two, 'Empty serial manifest'
+          assert len(set(all_files)) == len(all_files), 'Duplicate discovery'
+          assert not (set(one) & set(two)), 'Overlapping serial shards'
+          assert Counter(one + two) == Counter(all_files), 'Missing serial coverage'
+          print(f'Partition verified: {len(one)} + {len(two)} = {len(all_files)} unique serial files')
+          PY
+      - name: Run only the selected remaining native lane
+        run: |
+          unset DATABASE_URL GBRAIN_DATABASE_URL GBRAIN_HOME
+          set +e
+          case '${{ matrix.lane }}' in
+            serial-1) SHARD=1/2 bash scripts/run-serial-tests.sh 2>&1 | tee evidence/acceptance.log ;;
+            serial-2) SHARD=2/2 bash scripts/run-serial-tests.sh 2>&1 | tee evidence/acceptance.log ;;
+            slow) bun run test:slow 2>&1 | tee evidence/acceptance.log ;;
+          esac
+          result=${PIPESTATUS[0]}
+          set -e
+          printf '%s\n' "$result" > evidence/acceptance-exit.txt
+          test "$(git hash-object src/core/cycle/synthesize-verify.ts)" = "$(cat evidence/source-blob.txt)"
+          exit "$result"
+      - name: Preserve timing receipts and limitations
+        if: always()
+        run: |
+          mkdir -p evidence
+          if [[ -f .context/serial-timings.json ]]; then cp .context/serial-timings.json evidence/; fi
+          printf '%s\n' \
+            'AI-assisted fork-only continuation of quote #5451 validation.' \
+            'Native runners unchanged; serial files remain separate processes and exclusive files stay native-exclusive.' \
+            'Source patch and regression file match artifact 10847048803 byte-for-byte.' \
+            'Earlier four unit shards passed; that overall command was terminated before serial completion.' \
+            'These are separate receipts, not a new all-green test:full invocation.' \
+            'No PostgreSQL E2E, paid models, live corpus or native Windows/macOS tests.' \
+            > evidence/LIMITATIONS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: quote-5451-wave-3-${{ matrix.lane }}
+          path: evidence/
+          if-no-files-found: error
