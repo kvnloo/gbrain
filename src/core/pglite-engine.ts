@@ -2653,45 +2653,125 @@ export class PGLiteEngine implements BrainEngine {
     // #3695 — chunk_id 0 + empty chunk_text never gains chunk authority);
     // and detail='low' filters only the REPRESENTATIVE — pages without a
     // compiled_truth chunk still surface (unlike the keyword arm's filter).
-    const titlesSql =
-      `SELECT
-         p.slug, p.id as page_id, p.title, p.type, p.source_id,
-         p.effective_date, p.effective_date_source,
-         COALESCE(rep.id, 0) as chunk_id,
-         COALESCE(rep.chunk_index, 0) as chunk_index,
-         COALESCE(rep.chunk_text, '') as chunk_text,
-         COALESCE(rep.chunk_source, 'compiled_truth') as chunk_source,
-         ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
-         CASE WHEN p.updated_at < (
-           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
-         ) THEN true ELSE false END AS stale
-       FROM pages p
-       JOIN sources s ON s.id = p.source_id
-       LEFT JOIN LATERAL (
-         SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
-         FROM content_chunks cc
-         WHERE cc.page_id = p.id
-           AND cc.modality = 'text'
-           ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
-         ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC
-         LIMIT 1
-       ) rep ON true
-       WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', $1)
-         ${extraFilter} ${hardExcludeClause} ${visibilityClause}
-       ORDER BY score DESC, p.id ASC
-       LIMIT $2 OFFSET $3`;
+    // T1 (chunk 15): single-statement strict/OR. The old code ran the strict
+    // statement, then (on empty) a second OR statement. The strict-miss
+    // statement is pure overhead — a nested loop over every page (the
+    // planner skips the pages GIN index under JOIN+LIMIT) plus ~24ms of
+    // planning — before the OR query even runs. This keeps the strict leg
+    // as the driver and gates the OR leg on strict_paged being empty (via
+    // NOT EXISTS over the MATERIALIZED strict CTE — an uncorrelated
+    // initplan, evaluated once): on a strict hit the OR leg scans but
+    // scores nothing (the SELECT list never evaluates for rejected rows),
+    // on a strict miss it runs the full OR scan. Either way the loser's
+    // scores are never computed, and strict wins iff its paged set is
+    // non-empty — the old LIMIT/OFFSET-then-retry contract exactly.
+    // Decorations (representative-chunk lateral, stale subquery) run over
+    // the paged final rows only.
+    const orQueryT1 = buildOrFallbackWebsearchQuery(params[0] as string);
+    let titlesSql: string;
+    let titlesParams: unknown[];
+    let singleStatement = false;
+    if (orQueryT1) {
+      const orParamIdx = params.length + 1;
+      titlesParams = [...params, boundWebsearchQuery(orQueryT1)];
+      singleStatement = true;
+      titlesSql =
+        `WITH strict_paged AS MATERIALIZED (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source, p.updated_at,
+             ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
+             false AS relaxed
+           FROM pages p
+           JOIN sources s ON s.id = p.source_id
+           WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', $1)
+             ${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           ORDER BY score DESC, p.id ASC
+           LIMIT $2 OFFSET $3
+         ),
+         or_paged AS (
+           SELECT
+             p.slug, p.id as page_id, p.title, p.type, p.source_id,
+             p.effective_date, p.effective_date_source, p.updated_at,
+             ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', $${orParamIdx})) * ${sourceFactorCase} AS score,
+             true AS relaxed
+           FROM pages p
+           JOIN sources s ON s.id = p.source_id
+           WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', $${orParamIdx})
+             AND NOT EXISTS (SELECT 1 FROM strict_paged)
+             ${extraFilter} ${hardExcludeClause} ${visibilityClause}
+           ORDER BY score DESC, p.id ASC
+           LIMIT $2 OFFSET $3
+         ),
+         combined AS (
+           SELECT * FROM strict_paged
+           UNION ALL
+           SELECT * FROM or_paged
+         ),
+         decorated AS (
+           SELECT
+             c.slug, c.page_id, c.title, c.type, c.source_id,
+             c.effective_date, c.effective_date_source,
+             COALESCE(rep.id, 0) as chunk_id,
+             COALESCE(rep.chunk_index, 0) as chunk_index,
+             COALESCE(rep.chunk_text, '') as chunk_text,
+             COALESCE(rep.chunk_source, 'compiled_truth') as chunk_source,
+             c.score,
+             CASE WHEN c.updated_at < (
+               SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = c.page_id
+             ) THEN true ELSE false END AS stale,
+             c.relaxed
+           FROM combined c
+           LEFT JOIN LATERAL (
+             SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
+             FROM content_chunks cc
+             WHERE cc.page_id = c.page_id
+               AND cc.modality = 'text'
+               ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+             ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC
+             LIMIT 1
+           ) rep ON true
+         )
+         SELECT * FROM decorated
+         ORDER BY score DESC, page_id ASC`;
+    } else {
+      titlesSql =
+        `SELECT
+           p.slug, p.id as page_id, p.title, p.type, p.source_id,
+           p.effective_date, p.effective_date_source,
+           COALESCE(rep.id, 0) as chunk_id,
+           COALESCE(rep.chunk_index, 0) as chunk_index,
+           COALESCE(rep.chunk_text, '') as chunk_text,
+           COALESCE(rep.chunk_source, 'compiled_truth') as chunk_source,
+           ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
+           CASE WHEN p.updated_at < (
+             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+           ) THEN true ELSE false END AS stale
+         FROM pages p
+         JOIN sources s ON s.id = p.source_id
+         LEFT JOIN LATERAL (
+           SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
+           FROM content_chunks cc
+           WHERE cc.page_id = p.id
+             AND cc.modality = 'text'
+             ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+           ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC
+           LIMIT 1
+         ) rep ON true
+         WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', $1)
+           ${extraFilter} ${hardExcludeClause} ${visibilityClause}
+         ORDER BY score DESC, p.id ASC
+         LIMIT $2 OFFSET $3`;
+      titlesParams = params;
+    }
 
-    let { rows } = await this.db.query(titlesSql, params);
-    if (rows.length === 0) {
-      const orQuery = buildOrFallbackWebsearchQuery(params[0] as string);
-      if (orQuery) {
-        const fallbackParams = [...params];
-        fallbackParams[0] = boundWebsearchQuery(orQuery);
-        ({ rows } = await this.db.query(titlesSql, fallbackParams));
-        // 2026-09 (#3617 follow-up): same relaxed-row tagging as the keyword
-        // arm — see SearchResult.keyword_relaxed.
-        return (rows as Record<string, unknown>[]).map((r) => ({ ...rowToSearchResult(r), keyword_relaxed: true as const }));
-      }
+    const { rows } = await this.db.query(titlesSql, titlesParams);
+    if (singleStatement) {
+      // 2026-09 (#3617 follow-up): relaxed-row tagging, same contract as the
+      // old OR retry — an OR-of-common-terms match must not outvote a
+      // healthy vector arm (SearchResult.keyword_relaxed doc).
+      return (rows as Record<string, unknown>[]).map((r) =>
+        r.relaxed ? { ...rowToSearchResult(r), keyword_relaxed: true as const } : rowToSearchResult(r));
     }
     return (rows as Record<string, unknown>[]).map(rowToSearchResult);
   }
