@@ -1590,7 +1590,7 @@ export class PostgresEngine implements BrainEngine {
         if (relaxed) await tx`SET LOCAL enable_seqscan = off`;
         const boundParams = [...params];
         boundParams[0] = queryText;
-        const rows = await tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
+        const rows = await tx.unsafe(rawSql, boundParams as Parameters<typeof tx.unsafe>[1]);
         if (relaxed) await tx`SELECT set_config('enable_seqscan', ${previous[0].enable_seqscan}, true)`;
         return rows;
       }, { alwaysTransaction: true });
@@ -1741,7 +1741,7 @@ export class PostgresEngine implements BrainEngine {
     // the SET LOCAL statement_timeout needs a transaction regardless of the
     // GBRAIN_RLS_SCOPE_BINDING flag). The OR retry re-executes through the
     // same scoped wrapper.
-    const runTitles = (queryText: string, relaxed = false) =>
+    const runTitles = (queryText: string, relaxed = false, rawSql: string = rawQuery) =>
       this.withScopedReadTransaction(opts?.sourceIds, opts?.sourceId, async (tx) => {
         await tx`SET LOCAL statement_timeout = '8s'`;
         const preferIndex = relaxed && !requiresSafeChunks(opts);
@@ -1749,10 +1749,101 @@ export class PostgresEngine implements BrainEngine {
         if (preferIndex) await tx`SET LOCAL enable_seqscan = off`;
         const boundParams = [...params];
         boundParams[0] = queryText;
-        const rows = await tx.unsafe(rawQuery, boundParams as Parameters<typeof tx.unsafe>[1]);
+        const rows = await tx.unsafe(rawSql, boundParams as Parameters<typeof tx.unsafe>[1]);
         if (preferIndex) await tx`SELECT set_config('enable_seqscan', ${previous[0].enable_seqscan}, true)`;
         return rows;
       }, { alwaysTransaction: true });
+    // T1 (chunk 15): single-statement strict/OR — see pglite-engine.ts
+    // searchTitles. The strict-miss statement is pure overhead (nested loop
+    // over every page: the planner skips the pages GIN index under
+    // JOIN+LIMIT); the OR leg is gated on strict_paged being empty via
+    // NOT EXISTS over the MATERIALIZED strict CTE, so a strict hit never
+    // pays OR scoring. The single statement IS the relaxed-shape scan on
+    // the miss path, so it keeps the old relaxed path's
+    // enable_seqscan=off steering.
+    const orQueryT1 = buildOrFallbackWebsearchQuery(params[0] as string);
+    if (orQueryT1) {
+      params.push(boundWebsearchQuery(orQueryT1));
+      const orParam = `$${params.length}`;
+      const t1Query = `
+      WITH strict_paged AS MATERIALIZED (
+        SELECT
+          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+          p.effective_date, p.effective_date_source,
+          ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', $1)) * ${sourceFactorCase} AS score,
+          false AS relaxed
+        FROM pages p
+        JOIN sources s ON s.id = p.source_id
+        WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', $1)
+          ${typeClause}
+          ${typesClause}
+          ${excludeSlugsClause}
+          ${afterDateClause}
+          ${beforeDateClause}
+          ${sourceClause}
+          ${hardExcludeClause}
+          ${visibilityClause}
+        ORDER BY score DESC, page_id ASC
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      ),
+      or_paged AS (
+        SELECT
+          p.slug, p.id as page_id, p.title, p.type, p.source_id,
+          p.effective_date, p.effective_date_source,
+          ts_rank_cd(${titleVector}, websearch_to_tsquery('${ftsLang}', ${orParam})) * ${sourceFactorCase} AS score,
+          true AS relaxed
+        FROM pages p
+        JOIN sources s ON s.id = p.source_id
+        WHERE ${titleVector} @@ websearch_to_tsquery('${ftsLang}', ${orParam})
+          AND NOT EXISTS (SELECT 1 FROM strict_paged)
+          ${typeClause}
+          ${typesClause}
+          ${excludeSlugsClause}
+          ${afterDateClause}
+          ${beforeDateClause}
+          ${sourceClause}
+          ${hardExcludeClause}
+          ${visibilityClause}
+        ORDER BY score DESC, page_id ASC
+        LIMIT ${limitParam}
+        OFFSET ${offsetParam}
+      ),
+      combined AS (
+        SELECT * FROM strict_paged
+        UNION ALL
+        SELECT * FROM or_paged
+      ),
+      decorated AS (
+        SELECT
+          c.slug, c.page_id, c.title, c.type, c.source_id,
+          c.effective_date, c.effective_date_source,
+          COALESCE(rep.id, 0) as chunk_id,
+          COALESCE(rep.chunk_index, 0) as chunk_index,
+          COALESCE(rep.chunk_text, '') as chunk_text,
+          COALESCE(rep.chunk_source, 'compiled_truth') as chunk_source,
+          c.score,
+          false AS stale,
+          c.relaxed
+        FROM combined c
+        LEFT JOIN LATERAL (
+          SELECT cc.id, cc.chunk_index, cc.chunk_text, cc.chunk_source
+          FROM content_chunks cc
+          WHERE cc.page_id = c.page_id
+            AND cc.modality = 'text'
+            ${detailLow ? `AND cc.chunk_source = 'compiled_truth'` : ''}
+          ORDER BY (cc.chunk_source = 'compiled_truth') DESC, cc.chunk_index ASC
+          LIMIT 1
+        ) rep ON true
+      )
+      SELECT * FROM decorated
+      ORDER BY score DESC, page_id ASC
+    `;
+      const rows = await runTitles(params[0] as string, true, t1Query);
+      // 2026-09 (#3617 follow-up): relaxed-row tagging, same contract as the
+      // old OR retry — see SearchResult.keyword_relaxed.
+      return rows.map((r) => (r.relaxed ? { ...rowToSearchResult(r), keyword_relaxed: true as const } : rowToSearchResult(r)));
+    }
     let rows = await runTitles(params[0] as string);
     if (rows.length === 0) {
       const orQuery = buildOrFallbackWebsearchQuery(params[0] as string);
